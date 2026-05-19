@@ -1,0 +1,187 @@
+/**
+ * @NApiVersion 2.1
+ * @NScriptType ScheduledScript
+ */
+define(['N/search', 'N/record', 'N/runtime', 'N/format'],
+    function (search, record, runtime, format) {
+
+        function execute(context) {
+
+            // Read subsidiary passed from deployment
+            var subsidiaryArray = runtime.getCurrentScript().getParameter({
+                name: 'custscript_subsidiary_arr'
+            });
+
+            log.debug("Script Parameter - Subsidiaries", subsidiaryArray);
+            // subsidiary array
+            var subsidiaryId = [];
+            subsidiaryId = subsidiaryArray.split(',');
+            log.debug("START: for subsidiaries", subsidiaryId);
+
+
+            if (!subsidiaryId || subsidiaryId.length === 0) {
+                log.error('CONFIG ERROR', 'Subsidiary parameter not set');
+                return;
+            }
+
+
+
+
+            // 1. GET ALL ACTIVE CUSTOMERS
+
+            var customerSearch = search.create({
+                type: search.Type.CUSTOMER,
+                filters: [['subsidiary', 'anyof', subsidiaryId],
+                    'AND',
+                ['isinactive', 'is', 'F']],
+                columns: [
+                    search.createColumn({ name: 'internalid', summary: search.Summary.GROUP })
+                ]
+            });
+
+            var paged = customerSearch.runPaged({ pageSize: 1000 });
+
+            paged.pageRanges.forEach(function (pageRange) {
+                var page = paged.fetch({ index: pageRange.index });
+
+                page.data.forEach(function (custRow) {
+
+                    var customerId = custRow.getValue({
+                        name: 'internalid',
+                        summary: search.Summary.GROUP
+                    });
+
+                    log.debug("Processing Customer", customerId);
+
+                    try {
+
+                        // 2. LOAD CUSTOMER VALUES
+
+
+                        var custLookup = search.lookupFields({
+                            type: search.Type.CUSTOMER,
+                            id: customerId,
+                            columns: ['balance', 'overduebalance', 'custentity_wf_bal_store']
+                        });
+
+                        // Extract values safely
+                        var balance = parseFloat(custLookup.balance) || 0;
+                        var overdue = parseFloat(custLookup.overduebalance) || 0;
+
+
+                        // stored balance (old script logic)
+                        var storedBalance = custLookup.custentity_wf_bal_store;
+
+
+                        // 3. CHECK IF TODAY'S ENTRY EXISTS
+
+                        // var today = new Date();
+                        // var todayFormatted = format.format({
+                        //     value: today,
+                        //     type: format.Type.DATE
+                        // });
+
+                        // var existingToday = search.create({
+                        //     type: 'customrecordbal_cust_update',
+                        //     filters: [
+                        //         ['custrecord1502', 'is', customerId],
+                        //         'AND',
+                        //         ['custrecord1501', 'on', todayFormatted]
+                        //     ]
+                        // }).runPaged().count;
+
+                        //   if (existingToday === 0) {
+
+
+                        // 4. CREATE DAILY SNAPSHOT
+
+                        var snap = record.create({
+                            type: 'customrecordbal_cust_update'
+                        });
+
+                        snap.setValue('custrecord1502', customerId);       // customer
+                        snap.setValue('custrecord1500', balance);          // balance
+                        snap.setValue('custrecord1504', overdue);          // overdue
+                        // snap.setValue('custrecord1501', today);            // date
+
+                        var snapId = snap.save();
+                        log.debug("Snapshot created", snapId);
+
+                        // update stored balance
+                        record.submitFields({
+                            type: record.Type.CUSTOMER,
+                            id: customerId,
+                            values: {
+                                custentity_wf_bal_store: balance
+                            }
+                        });
+                        //  }
+
+                        // ==========================
+                        // 5. GET HIGHEST BALANCE IN LAST 18 MONTHS
+                        // ==========================
+                        var date18MonthsAgo = new Date();
+                        date18MonthsAgo.setMonth(date18MonthsAgo.getMonth() - 18);
+
+                        var date18Formatted = format.format({
+                            value: date18MonthsAgo,
+                            type: format.Type.DATE
+                        });
+
+                        var highSearch = search.create({
+                            type: 'customrecordbal_cust_update',
+                            filters: [
+                                ['custrecord1502', 'is', customerId],
+                                'AND',
+                                ['custrecord1501', 'onorafter', date18Formatted]
+                            ],
+                            columns: [
+                                search.createColumn({ name: 'custrecord1500', sort: search.Sort.DESC }),
+                                'custrecord1501'
+                            ]
+                        });
+
+                        var highResult = highSearch.run().getRange({ start: 0, end: 1 });
+
+                        if (highResult && highResult.length > 0) {
+                            var highestBal = parseFloat(highResult[0].getValue('custrecord1500')) || 0;
+                            var highestDate = highResult[0].getValue('custrecord1501');
+
+
+                            // 6. UPDATE CUSTOMER FIELDS
+
+                            record.submitFields({
+                                type: record.Type.CUSTOMER,
+                                id: customerId,
+                                values: {
+                                    custentity_highestarbalance: highestBal,
+                                    custentity_adc_high_bal_on: highestDate
+                                }
+                            });
+
+                            log.debug("Highest Balance Updated", {
+                                customer: customerId,
+                                highest: highestBal,
+                                date: highestDate
+                            });
+                        }
+
+                    } catch (err) {
+                        log.error("Error Processing Customer " + customerId, err.message);
+                    }
+
+                    // ==========================
+                    // 7. GOVERNANCE PROTECTION
+                    // ==========================
+                    if (runtime.getCurrentScript().getRemainingUsage() < 200) {
+                        log.audit("Yielding Script", "Low Usage");
+                        return false;
+                    }
+                });
+            });
+
+            log.debug("END", "Daily Processing Complete");
+        }
+
+        return { execute: execute };
+    });
